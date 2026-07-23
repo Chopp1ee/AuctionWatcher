@@ -1,5 +1,13 @@
 # config.py
-TOKEN = "8604463019:AAEoT2_1lCF_H1fUyLn5B_WmRQx-xgrLtkg"
-DATABASE_PATH = "auctions.db"
-CHECK_INTERVAL = 67 #СІККСС СЕЕЕЕВЕЕЕЕЕННН
-ADMIN_IDS = [917729441, 494936799]
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_PATH = os.getenv("DATABASE_PATH", "auctions.db")
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 300))
+ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+
+if not TOKEN:
+    raise ValueError("❌ BOT_TOKEN не знайдено в .env файлі!")
