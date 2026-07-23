@@ -1,8 +1,17 @@
 # database.py
 import sqlite3
 from api import get_auction_info, format_date
+from config import DATABASE_PATH
 
-DB_NAME = "auctions.db"
+DB_NAME = DATABASE_PATH
+
+
+def get_conn():
+    """Підключення з увімкненим WAL — бот пише з кількох джобів одночасно"""
+    conn = sqlite3.connect(DB_NAME, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
 
 
 def init_db():
@@ -48,6 +57,142 @@ def init_db():
             new_date TEXT,
             changed_at TEXT,
             FOREIGN KEY (chat_id) REFERENCES users(chat_id)
+        )
+    """)
+
+    # ── Пошук нових лотів за підписками ──────────────────────────────────
+
+    # Локальний кеш процедур із фіду Prozorro.
+    # Тягнути фід на кожен запит неможливо (3.6 МБ на 100 записів), тому
+    # один фоновий джоб наповнює кеш, а матчинг і ретроспектива працюють по ньому.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS procedures (
+            procedure_id      TEXT PRIMARY KEY,
+            auction_id        TEXT,
+            selling_method    TEXT,
+            method_group      TEXT,
+            status            TEXT,
+            title             TEXT,
+            description       TEXT,
+            region            TEXT,
+            locality          TEXT,
+            cadastral         TEXT,
+            land_area         REAL,
+            amount            REAL,
+            currency          TEXT,
+            organizer_name    TEXT,
+            organizer_id      TEXT,
+            date_published    TEXT,
+            date_modified     TEXT,
+            tender_start      TEXT,
+            tender_end        TEXT,
+            rectification_end TEXT,
+            auction_start     TEXT,
+            bids_count        INTEGER,
+            min_bids          INTEGER,
+            first_seen        TEXT,
+            last_seen         TEXT
+        )
+    """)
+    # для баз, створених до появи колонки
+    if "min_bids" not in {r[1] for r in cursor.execute("PRAGMA table_info(procedures)")}:
+        cursor.execute("ALTER TABLE procedures ADD COLUMN min_bids INTEGER")
+    for idx, col in [
+        ("idx_proc_published", "date_published"),
+        ("idx_proc_modified", "date_modified"),
+        ("idx_proc_group", "method_group"),
+        ("idx_proc_region", "region"),
+        ("idx_proc_auction", "auction_id"),
+        ("idx_proc_status", "status"),
+    ]:
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS {idx} ON procedures({col})")
+
+    # Курсор обходу фіду: на чому зупинилися по кожній добі
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS feed_cursor (
+            feed_date     TEXT PRIMARY KEY,
+            position      INTEGER DEFAULT 0,
+            last_modified TEXT,
+            finished      INTEGER DEFAULT 0,
+            updated_at    TEXT
+        )
+    """)
+
+    # Підписки користувачів (до 5 на людину)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id       INTEGER,
+            name          TEXT,
+            enabled       INTEGER DEFAULT 1,
+            keywords      TEXT,
+            exclude_words TEXT,
+            method_groups TEXT,
+            regions       TEXT,
+            organizer     TEXT,
+            cadastral     TEXT,
+            price_min     REAL,
+            price_max     REAL,
+            area_min      REAL,
+            area_max      REAL,
+            created_at    TEXT,
+            FOREIGN KEY (chat_id) REFERENCES users(chat_id)
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_subs_chat ON subscriptions(chat_id)")
+
+    # Що вже надсилали — щоб один лот не прийшов двічі
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sub_notifications (
+            sub_id       INTEGER,
+            procedure_id TEXT,
+            event        TEXT,
+            notified_at  TEXT,
+            PRIMARY KEY (sub_id, procedure_id, event)
+        )
+    """)
+
+    # Денна квота сповіщень на підписку
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS notify_quota (
+            sub_id INTEGER,
+            day    TEXT,
+            sent   INTEGER DEFAULT 0,
+            warned INTEGER DEFAULT 0,
+            PRIMARY KEY (sub_id, day)
+        )
+    """)
+
+    # ── Лічильник ставок (адмінська фіча) ────────────────────────────────
+
+    # Кожна зафіксована зміна dateModified лота під наглядом
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bid_events (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            auction_id    TEXT,
+            procedure_id  TEXT,
+            date_modified TEXT,
+            status        TEXT,
+            counted       INTEGER DEFAULT 0,
+            detected_at   TEXT,
+            UNIQUE(auction_id, date_modified)
+        )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_bidev_auction ON bid_events(auction_id)")
+
+    # Підсумок по лоту: наша оцінка проти факту після розкриття
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bid_estimates (
+            auction_id   TEXT PRIMARY KEY,
+            procedure_id TEXT,
+            title        TEXT,
+            estimate     INTEGER DEFAULT 0,
+            actual       INTEGER,
+            tender_end   TEXT,
+            min_bids     INTEGER,
+            summary_sent INTEGER DEFAULT 0,
+            revealed_at  TEXT,
+            updated_at   TEXT
         )
     """)
 

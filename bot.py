@@ -37,6 +37,20 @@ from monitor import check_auctions
 from logger import logger
 from backup import backup_database
 from exporter import export_history_to_excel, cleanup_old_exports
+from config import BID_WATCH_INTERVAL, FEED_INTERVAL
+from watcher import bootstrap_job, daily_cache_cleanup, watch_new_lots
+from bidtracker import bid_deadline_summary, import_bid_history_job, poll_bid_watch
+from handlers import (
+    bids_command,
+    feedstat_command,
+    filters_command,
+    handle_bids_callback,
+    handle_sub_callback,
+    handle_track_callback,
+    handle_wizard_callback,
+    handle_wizard_text,
+)
+from wizard import clear_wizard, get_state
 
 
 # Створюємо базу даних при запуску
@@ -44,21 +58,32 @@ init_db()
 
 
 # Головне меню (кнопки внизу екрану)
-def get_main_menu():
+def get_main_menu(chat_id=None):
+    """Адміни бачать додатковий ряд з лічильником заявок і станом моніторингу"""
     keyboard = [
         [
-            KeyboardButton("📋 Мої аукціони"),
-            KeyboardButton("➕ Додати аукціон")
+            KeyboardButton("📡 Мої фільтри"),
+            KeyboardButton("📋 Мої аукціони")
         ],
         [
-            KeyboardButton("📜 Історія змін"),
-            KeyboardButton("⚡ Швидке видалення")
+            KeyboardButton("➕ Додати аукціон"),
+            KeyboardButton("📜 Історія змін")
         ],
         [
-            KeyboardButton("📊 Експорт в Excel"),
+            KeyboardButton("⚡ Швидке видалення"),
+            KeyboardButton("📊 Експорт в Excel")
+        ],
+        [
             KeyboardButton("📖 Допомога")
         ]
     ]
+
+    if chat_id in ADMIN_IDS:
+        keyboard.insert(0, [
+            KeyboardButton("🎯 Заявки на лотах"),
+            KeyboardButton("📈 Стан моніторингу")
+        ])
+
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
@@ -420,10 +445,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await update.message.reply_text(
             "👋 Привіт!\n\n"
-            "Я бот для моніторингу аукціонів Prozorro.Продажі.\n\n"
-            "🔔 Я буду сповіщати вас про зміни статусів та дат.\n\n"
-            "Використовуйте кнопки внизу для керування:",
-            reply_markup=get_main_menu()
+            "Я бот для моніторингу аукціонів Prozorro.Продажі. Умію дві речі:\n\n"
+            "📡 <b>Шукати нові лоти за вашими критеріями.</b>\n"
+            "Налаштуйте фільтр — регіон, тип торгів, ключові слова, ціна, площа — "
+            "і я надсилатиму кожен новий лот, щойно він з'явиться.\n\n"
+            "📋 <b>Стежити за конкретними лотами.</b>\n"
+            "Додайте лот — сповіщу про зміну статусу чи умов.\n\n"
+            "Почніть з кнопки «📡 Мої фільтри».",
+            parse_mode="HTML",
+            reply_markup=get_main_menu(update.effective_chat.id)
         )
         
     except Exception as e:
@@ -432,25 +462,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /help"""
+    from config import DAILY_NOTIFY_LIMIT, MAX_SUBS_PER_USER
+
     await update.message.reply_text(
-        "📖 Допомога\n\n"
-        "Як додати аукціон:\n"
-        "1. Натисніть кнопку '➕ Додати аукціон'\n"
-        "2. Надішліть посилання або ID аукціону\n\n"
-        "Доступні дії:\n"
-        "📋 Мої аукціони - перегляд списку\n"
-        "➕ Додати аукціон - додати новий\n"
-        "📜 Історія змін - перегляд змін\n"
-        "⚡ Швидке видалення - видалити аукціони\n"
-        "📊 Експорт в Excel - вивантажити історію в Excel\n\n"
-        "Статуси аукціонів:\n"
-        "📝 Подання заявок на участь\n"
-        "🟡 Виправлення умов\n"
-        "🔨 Аукціон триває\n"
-        "✅ Завершено\n"
-        "❌ Відмінено\n"
-        "⏳ Очікує",
-        reply_markup=get_main_menu()
+        "📖 <b>Допомога</b>\n\n"
+        "<b>📡 Мої фільтри — пошук нових лотів</b>\n"
+        "Створіть фільтр, і я сам знайду лоти під ваші критерії:\n"
+        "• тип торгів (земля, оренда, приватизація…)\n"
+        "• регіон\n"
+        "• ключові слова та слова-винятки\n"
+        "• ціна, площа, організатор, кадастровий номер\n\n"
+        f"Фільтрів можна мати до {MAX_SUBS_PER_USER}. "
+        f"Ліміт — {DAILY_NOTIFY_LIMIT} лотів на добу на кожен фільтр: "
+        "якщо впираєтесь у нього, критерії варто звузити.\n"
+        "Фільтр можна тимчасово вимкнути, не видаляючи.\n\n"
+        "<b>📋 Мої аукціони — стеження за конкретним лотом</b>\n"
+        "Натисніть «➕ Додати аукціон» і надішліть посилання або ID "
+        "(<code>LLE001-UA-20260713-73886</code>). "
+        "Сповіщу про зміну статусу й дати.\n\n"
+        "<b>Команди</b>\n"
+        "/filters — мої фільтри\n"
+        "/list — мої аукціони\n"
+        "/history — історія змін\n"
+        "/export — вивантажити історію в Excel\n\n"
+        "<b>Основні статуси</b>\n"
+        "📝 Подання заявок · 🟡 Виправлення умов · 🔨 Аукціон триває\n"
+        "✅ Завершено · ❌ Відмінено",
+        parse_mode="HTML",
+        reply_markup=get_main_menu(update.effective_chat.id)
     )
 
 
@@ -463,7 +502,7 @@ async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• LLE001-UA-20260713-73886\n"
         "• https://prozorro.sale/auction/UA-...\n"
         "• https://procedure.prozorro.sale/api/procedures/...",
-        reply_markup=get_main_menu()
+        reply_markup=get_main_menu(update.effective_chat.id)
     )
     
     context.user_data["waiting_for_auction"] = True
@@ -479,7 +518,7 @@ async def list_auctions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "📭 У вас немає аукціонів у відстеженні.\n"
                 "Натисніть '➕ Додати аукціон' щоб додати.",
-                reply_markup=get_main_menu()
+                reply_markup=get_main_menu(update.effective_chat.id)
             )
             return
         
@@ -493,7 +532,7 @@ async def list_auctions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"❌ Помилка в list_auctions: {e}")
         await update.message.reply_text(
             "❌ Помилка при отриманні списку аукціонів.",
-            reply_markup=get_main_menu()
+            reply_markup=get_main_menu(update.effective_chat.id)
         )
 
 
@@ -506,7 +545,7 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not auctions:
             await update.message.reply_text(
                 "📭 У вас немає аукціонів у відстеженні.",
-                reply_markup=get_main_menu()
+                reply_markup=get_main_menu(update.effective_chat.id)
             )
             return
         
@@ -519,7 +558,7 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"❌ Помилка в history_command: {e}")
         await update.message.reply_text(
             "❌ Помилка при отриманні історії.",
-            reply_markup=get_main_menu()
+            reply_markup=get_main_menu(update.effective_chat.id)
         )
 
 
@@ -605,7 +644,7 @@ async def quick_remove_command(update: Update, context: ContextTypes.DEFAULT_TYP
         if not auctions:
             await update.message.reply_text(
                 "📭 У вас немає аукціонів для видалення.",
-                reply_markup=get_main_menu()
+                reply_markup=get_main_menu(update.effective_chat.id)
             )
             return
         
@@ -618,7 +657,7 @@ async def quick_remove_command(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.error(f"❌ Помилка в quick_remove: {e}")
         await update.message.reply_text(
             "❌ Помилка при видаленні.",
-            reply_markup=get_main_menu()
+            reply_markup=get_main_menu(update.effective_chat.id)
         )
 
 
@@ -632,7 +671,7 @@ async def export_history_command(update: Update, context: ContextTypes.DEFAULT_T
         if not all_auctions:
             await update.message.reply_text(
                 "📭 У вас немає аукціонів для експорту.",
-                reply_markup=get_main_menu()
+                reply_markup=get_main_menu(update.effective_chat.id)
             )
             return
         
@@ -647,7 +686,7 @@ async def export_history_command(update: Update, context: ContextTypes.DEFAULT_T
             await update.message.reply_text(
                 "📭 Немає аукціонів з історією змін для експорту.\n\n"
                 "💡 Історія з'являється після того, як відбудуться зміни в аукціоні.",
-                reply_markup=get_main_menu()
+                reply_markup=get_main_menu(update.effective_chat.id)
             )
             return
         
@@ -660,7 +699,7 @@ async def export_history_command(update: Update, context: ContextTypes.DEFAULT_T
         logger.error(f"❌ Помилка в export_history: {e}")
         await update.message.reply_text(
             "❌ Помилка при експорті.",
-            reply_markup=get_main_menu()
+            reply_markup=get_main_menu(update.effective_chat.id)
         )
 
 
@@ -730,7 +769,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         chat_id = update.effective_chat.id
         data = query.data
-        
+
+        # Підписки, майстер фільтрів і кнопка «стежити за лотом»
+        if data.startswith("s_"):
+            await handle_sub_callback(update, context, data)
+            return
+
+        if data.startswith("w_"):
+            await handle_wizard_callback(update, context, data)
+            return
+
+        if data.startswith("track_"):
+            await handle_track_callback(update, context, data)
+            return
+
+        if data.startswith("b_"):
+            await handle_bids_callback(update, context, data)
+            return
+
         # Обробка пагінації списку
         if data.startswith("list_page_"):
             try:
@@ -786,7 +842,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await query.message.reply_text(
                 "Виберіть дію:",
-                reply_markup=get_main_menu()
+                reply_markup=get_main_menu(update.effective_chat.id)
             )
             return
         
@@ -801,7 +857,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.edit_message_text("📭 У вас немає аукціонів у відстеженні.")
                     await query.message.reply_text(
                         "Виберіть дію:",
-                        reply_markup=get_main_menu()
+                        reply_markup=get_main_menu(update.effective_chat.id)
                     )
             except Exception as e:
                 logger.error(f"❌ Помилка оновлення списку: {e}")
@@ -838,7 +894,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text("✅ Всі аукціони видалено!")
                 await query.message.reply_text(
                     "Виберіть дію:",
-                    reply_markup=get_main_menu()
+                    reply_markup=get_main_menu(update.effective_chat.id)
                 )
                 return
             
@@ -863,12 +919,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обробка текстових повідомлень"""
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
-    
+
+    MENU_BUTTONS = (
+        "📡 Мої фільтри", "📋 Мої аукціони", "➕ Додати аукціон", "📜 Історія змін",
+        "⚡ Швидке видалення", "📊 Експорт в Excel", "📖 Допомога",
+        "🎯 Заявки на лотах", "📈 Стан моніторингу",
+    )
+
+    # Натиснута кнопка меню під час роботи майстра — виходимо з майстра
+    if text in MENU_BUTTONS and get_state(context):
+        clear_wizard(context)
+
+    # Текст належить майстру фільтрів
+    if text not in MENU_BUTTONS and get_state(context):
+        if await handle_wizard_text(update, context, text):
+            return
+
     # Обробка кнопок головного меню
+    if text == "📡 Мої фільтри":
+        await filters_command(update, context)
+        return
+
+    if text == "🎯 Заявки на лотах":
+        await bids_command(update, context)
+        return
+
+    if text == "📈 Стан моніторингу":
+        await feedstat_command(update, context)
+        return
+
     if text == "📋 Мої аукціони":
         await list_auctions(update, context)
         return
-    
+
     if text == "➕ Додати аукціон":
         await add_command(update, context)
         return
@@ -907,7 +990,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "• LLE001-UA-20260713-73886\n"
                     "• https://prozorro.sale/auction/UA-...\n"
                     "• https://procedure.prozorro.sale/api/procedures/...",
-                    reply_markup=get_main_menu()
+                    reply_markup=get_main_menu(update.effective_chat.id)
                 )
                 return
             
@@ -935,7 +1018,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"🕒 Оновлено: {date_f}\n\n"
                     f"💡 Використовуйте `/list` для перегляду всіх аукціонів.",
                     parse_mode="Markdown",
-                    reply_markup=get_main_menu()
+                    reply_markup=get_main_menu(update.effective_chat.id)
                 )
                 return
         
@@ -955,14 +1038,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🕒 Оновлено: {date_f}\n\n"
             f"Використовуйте кнопки для керування:",
             parse_mode="Markdown",
-            reply_markup=get_main_menu()
+            reply_markup=get_main_menu(update.effective_chat.id)
         )
         
     except Exception as e:
         print(f"❌ Помилка в handle_message: {e}")
         await update.message.reply_text(
             f"❌ Помилка:\n{str(e)}",
-            reply_markup=get_main_menu()
+            reply_markup=get_main_menu(update.effective_chat.id)
         )
 
 
@@ -1172,7 +1255,45 @@ def main():
         interval=86400,
         first=3600,
     )
-    
+
+    # Разове наповнення кешу історією — щоб ретроспектива мала на чому працювати
+    app.job_queue.run_once(bootstrap_job, when=20, name="bootstrap_history")
+
+    # Перенос уже накопиченої історії змін у лічильник заявок
+    app.job_queue.run_once(import_bid_history_job, when=10, name="import_bid_history")
+
+    # Пошук нових лотів за підписками користувачів
+    app.job_queue.run_repeating(
+        watch_new_lots,
+        interval=FEED_INTERVAL,
+        first=15,
+        name="watch_new_lots",
+    )
+
+    # Лічильник заявок по лотах адмінів
+    app.job_queue.run_repeating(
+        poll_bid_watch,
+        interval=BID_WATCH_INTERVAL,
+        first=45,
+        name="poll_bid_watch",
+    )
+
+    # Підсумок перед закриттям подання заявок
+    app.job_queue.run_repeating(
+        bid_deadline_summary,
+        interval=600,
+        first=120,
+        name="bid_deadline_summary",
+    )
+
+    # Чистка застарілого кешу процедур
+    app.job_queue.run_repeating(
+        daily_cache_cleanup,
+        interval=86400,
+        first=7200,
+        name="cache_cleanup",
+    )
+
     # Команди
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
@@ -1181,12 +1302,15 @@ def main():
     app.add_handler(CommandHandler("history", history_command))
     app.add_handler(CommandHandler("remove_quick", quick_remove_command))
     app.add_handler(CommandHandler("export", export_history_command))
-    
+    app.add_handler(CommandHandler("filters", filters_command))
+
     # Адмін команди
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("users", users_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("force_check", force_check_command))
+    app.add_handler(CommandHandler("bids", bids_command))
+    app.add_handler(CommandHandler("feedstat", feedstat_command))
     
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(
