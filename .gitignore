@@ -1,0 +1,42 @@
+# Секрети та конфігурація
+.env
+config_local.py
+config.py  # Якщо в ньому є токен – краще не завантажувати
+
+# База даних
+*.db
+*.sqlite
+*.sqlite3
+
+# Логи та бек-апи
+logs/
+backups/
+*.log
+
+# Експорти Excel
+exports/
+*.xlsx
+
+# Кеш Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Віртуальне середовище
+venv/
+.venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Системні файли
+.DS_Store
+Thumbs.db
+*.tmp
